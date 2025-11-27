@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "bun-runner": {
+      "command": "bun",
+      "args": ["run", "/Users/tim/repos/bun-runner-mcp/src/mcp/server.ts"],
+      "env": {
+        "EXECUTION_MODE": "container"
+      }
+    }
+  }
+}

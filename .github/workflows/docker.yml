@@ -1,0 +1,270 @@
+name: Docker Build and Security Scan
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - 'src/**'
+      - '.github/workflows/docker.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - 'src/**'
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: bun-sandbox
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-test:
+    name: Build and Test Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test container startup
+        run: |
+          echo "Starting container..."
+          docker run -d \
+            --name test-sandbox \
+            --read-only \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges:true \
+            -m 256m \
+            --cpus=0.5 \
+            --pids-limit=50 \
+            -p 9998:9998 \
+            -p 9999:9999 \
+            --tmpfs /tmp:size=64M,mode=1777,noexec,nosuid,nodev \
+            --tmpfs /sandbox/code:size=32M,mode=0755,noexec,nosuid,nodev \
+            ${{ env.IMAGE_NAME }}:test
+
+          echo "Waiting for container to be ready..."
+          sleep 5
+
+          echo "Checking if container is running..."
+          docker ps | grep test-sandbox
+
+          echo "Checking health endpoint..."
+          for i in {1..10}; do
+            if curl -f http://localhost:9999/health 2>/dev/null; then
+              echo "Health check passed"
+              break
+            fi
+            if [ $i -eq 10 ]; then
+              echo "Health check failed"
+              docker logs test-sandbox
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Test code execution
+        run: |
+          echo "Testing code execution..."
+          response=$(curl -s -X POST http://localhost:9998/execute \
+            -H "Content-Type: application/json" \
+            -d '{"code": "console.log(\"Hello from CI\")"}')
+
+          echo "Response: $response"
+
+          if echo "$response" | grep -q "Hello from CI"; then
+            echo "Code execution test passed"
+          else
+            echo "Code execution test failed"
+            docker logs test-sandbox
+            exit 1
+          fi
+
+      - name: Test resource limits
+        run: |
+          echo "Checking resource limits..."
+
+          # Check memory limit
+          mem_limit=$(docker inspect test-sandbox --format='{{.HostConfig.Memory}}')
+          echo "Memory limit: $mem_limit bytes (expected: 268435456)"
+
+          # Check CPU limit
+          cpu_quota=$(docker inspect test-sandbox --format='{{.HostConfig.CpuQuota}}')
+          echo "CPU quota: $cpu_quota"
+
+          # Check PID limit
+          pids_limit=$(docker inspect test-sandbox --format='{{.HostConfig.PidsLimit}}')
+          echo "PIDs limit: $pids_limit (expected: 50)"
+
+          if [ "$pids_limit" != "50" ]; then
+            echo "PIDs limit mismatch"
+            exit 1
+          fi
+
+      - name: Test security settings
+        run: |
+          echo "Checking security settings..."
+
+          # Check read-only filesystem
+          readonly_rootfs=$(docker inspect test-sandbox --format='{{.HostConfig.ReadonlyRootfs}}')
+          echo "Read-only rootfs: $readonly_rootfs (expected: true)"
+
+          if [ "$readonly_rootfs" != "true" ]; then
+            echo "Read-only rootfs not enabled"
+            exit 1
+          fi
+
+          # Check capabilities
+          cap_drop=$(docker inspect test-sandbox --format='{{.HostConfig.CapDrop}}')
+          echo "Capabilities dropped: $cap_drop (expected: [ALL])"
+
+          if ! echo "$cap_drop" | grep -q "ALL"; then
+            echo "ALL capabilities not dropped"
+            exit 1
+          fi
+
+          # Check user
+          user=$(docker inspect test-sandbox --format='{{.Config.User}}')
+          echo "User: $user (expected: sandbox)"
+
+          if [ "$user" != "sandbox" ]; then
+            echo "Not running as sandbox user"
+            exit 1
+          fi
+
+      - name: Clean up test container
+        if: always()
+        run: |
+          docker stop test-sandbox || true
+          docker rm test-sandbox || true
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:test
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Trivy in table format
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:test
+          format: 'table'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Build and push final image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate SBOM
+        if: github.event_name != 'pull_request'
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ github.repository }}:latest
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+
+  security-scan:
+    name: Security Compliance Check
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Hadolint (Dockerfile linter)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+      - name: Check for secrets in Dockerfile
+        run: |
+          echo "Checking for potential secrets..."
+          if grep -iE "(password|secret|key|token|api)" Dockerfile; then
+            echo "Warning: Potential secrets found in Dockerfile"
+            exit 1
+          fi
+          echo "No secrets found"
+
+      - name: Validate seccomp profile
+        run: |
+          echo "Validating seccomp profile..."
+          if [ -f seccomp-profile.json ]; then
+            if ! jq empty seccomp-profile.json; then
+              echo "Invalid JSON in seccomp-profile.json"
+              exit 1
+            fi
+            echo "Seccomp profile is valid JSON"
+          fi
+
+      - name: Check Docker Compose configuration
+        run: |
+          echo "Validating Docker Compose file..."
+          docker compose -f docker-compose.yml config > /dev/null
+          echo "Docker Compose configuration is valid"
