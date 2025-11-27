@@ -11,29 +11,21 @@ An MCP (Model Context Protocol) server that executes TypeScript/JavaScript code 
   - **Container**: Uses Apple Containers for VM-level isolation (macOS 26+)
 - **HTTP Proxy**: All network requests are routed through a permission-checking proxy
 
-## Installation
+## Quick Start
+
+### Installation
 
 ```bash
+git clone https://github.com/timoconnellaus/bun-runner-mcp.git
+cd bun-runner-mcp
 bun install
-```
-
-## Usage
-
-### Running the MCP Server
-
-```bash
-bun run start
-```
-
-Or for development with watch mode:
-
-```bash
-bun run dev
 ```
 
 ### Claude Desktop Configuration
 
-Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+**Standard Mode (Preload Sandbox):**
 
 ```json
 {
@@ -44,6 +36,37 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
     }
   }
 }
+```
+
+**Container Mode (Apple Containers - Recommended for untrusted code):**
+
+```json
+{
+  "mcpServers": {
+    "bun-runner": {
+      "command": "bun",
+      "args": ["run", "/path/to/bun-runner-mcp/src/mcp/server.ts"],
+      "env": {
+        "EXECUTION_MODE": "container"
+      }
+    }
+  }
+}
+```
+
+> **Note:** Container mode requires macOS 26 (Tahoe) or later with Apple Containers installed.
+
+### Running Manually
+
+```bash
+# Standard mode
+bun run start
+
+# Container mode
+EXECUTION_MODE=container bun run start
+
+# Development with watch
+bun run dev
 ```
 
 ## MCP Tools
@@ -120,31 +143,6 @@ For stronger isolation, use Apple Containers which provides VM-level isolation. 
 - **macOS 26 (Tahoe)** or later
 - Apple Containers CLI (`container` command) installed
 - Internet connection for initial image pull
-
-#### Enabling Container Mode
-
-Set the `EXECUTION_MODE` environment variable to `container`:
-
-```bash
-# Run directly with container mode
-EXECUTION_MODE=container bun run start
-```
-
-Or in your Claude Desktop config:
-
-```json
-{
-  "mcpServers": {
-    "bun-runner": {
-      "command": "bun",
-      "args": ["run", "/path/to/bun-runner-mcp/src/mcp/server.ts"],
-      "env": {
-        "EXECUTION_MODE": "container"
-      }
-    }
-  }
-}
-```
 
 #### How It Works
 
