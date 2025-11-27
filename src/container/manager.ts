@@ -11,6 +11,7 @@ import {
   RESOURCE_LIMITS,
   EXECUTION_TIMEOUT_MS,
 } from './config.js';
+import { getDiagnostics, stopTsServer } from './tsserver.js';
 
 /**
  * Bun configuration for package caching.
@@ -254,19 +255,14 @@ export async function executeCode(
     // Write code to host-mounted volume
     await writeFile(hostPath, code, 'utf-8');
 
-    // Type-check the code using tsc with incremental mode
-    // Uses tsconfig.json in /code with build cache in /packages
-    const checkResult = await execInContainer(
-      container.containerId,
-      ['bun', 'x', 'tsc', '--noEmit', '--incremental', '--pretty'],
-      { timeout: 15000, workdir: CONTAINER_PATHS.code }
-    );
+    // Type-check the code using tsserver for fast incremental checking
+    // After initial startup (~2-3s), subsequent checks are ~50-200ms
+    const diagnostics = await getDiagnostics(container.containerId, containerPath);
 
-    if (!checkResult.success) {
+    if (!diagnostics.success) {
       // Clean up and return type errors
       await unlink(hostPath).catch(() => {});
-      // Parse tsc output for cleaner error messages
-      const errors = checkResult.stdout || checkResult.stderr;
+      const errors = diagnostics.errors.join('\n');
       return {
         success: false,
         stdout: '',
@@ -309,6 +305,9 @@ export async function stopContainer(
   container: ContainerInfo
 ): Promise<{ success: boolean; error?: string }> {
   try {
+    // Stop the tsserver if running
+    await stopTsServer(container.containerId);
+
     // Stop the container
     const stopResult = await runContainerCommand(['stop', container.containerId], { timeout: 10000 });
 

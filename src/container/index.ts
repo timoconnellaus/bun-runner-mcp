@@ -61,3 +61,12 @@ export {
   resolvePackages,
   type PackageResolutionResult,
 } from './packages.js';
+
+// TypeScript Language Server
+export {
+  type DiagnosticsResult,
+  TsServer,
+  getTsServer,
+  stopTsServer,
+  getDiagnostics,
+} from './tsserver.js';
