@@ -16,9 +16,16 @@ import {
 } from '../types/index.js';
 import { executeInSandbox, type ExecutionResult } from './executor.js';
 import { PermissionStore } from '../proxy/store.js';
+import { SnippetStore } from '../snippets/store.js';
+import { getCurrentContainerId } from '../container/session.js';
+import { getTsServer, type ExportedFunction } from '../container/tsserver.js';
+import { CONTAINER_PATHS } from '../container/config.js';
 
 // Global shared permission store (used by both MCP tools and HTTP proxy)
 const permissionStore = new PermissionStore();
+
+// Global snippet store for persistent code snippets
+const snippetStore = new SnippetStore();
 
 /**
  * Create and configure the MCP server
@@ -44,7 +51,8 @@ function createServer(): Server {
           name: 'run_code',
           description:
             'Execute TypeScript/JavaScript code in a sandboxed Bun environment. ' +
-            'Code runs with restricted permissions - network, file, and environment access must be explicitly granted.',
+            'Code runs with restricted permissions - network, file, and environment access must be explicitly granted. ' +
+            'To use saved snippets, add // @use-snippet: <name> directives at the top of your code.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -97,6 +105,79 @@ function createServer(): Server {
             required: ['permission'],
           },
         },
+        {
+          name: 'save_snippet',
+          description:
+            'Save a named code snippet for later reuse. Snippets must include a JSDoc comment with @description tag. ' +
+            'To use a snippet in run_code, add: // @use-snippet: <name> at the top of your code. ' +
+            'Example snippet: /** @description Fetches weather data */ export function fetchWeather(city: string) { ... }',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              name: {
+                type: 'string',
+                description: 'Snippet name (alphanumeric, hyphens, underscores). Example: fetch-weather',
+              },
+              code: {
+                type: 'string',
+                description: 'TypeScript code with JSDoc @description',
+              },
+            },
+            required: ['name', 'code'],
+          },
+        },
+        {
+          name: 'list_snippets',
+          description: 'List all saved code snippets with their names and descriptions.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
+        {
+          name: 'get_snippet',
+          description: 'Get the full code and metadata for a saved snippet.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              name: {
+                type: 'string',
+                description: 'Name of the snippet to retrieve',
+              },
+            },
+            required: ['name'],
+          },
+        },
+        {
+          name: 'get_snippet_types',
+          description:
+            'Get TypeScript type signatures for exported functions in a snippet. ' +
+            'Requires container mode (EXECUTION_MODE=container) to be enabled.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              name: {
+                type: 'string',
+                description: 'Name of the snippet to get types for',
+              },
+            },
+            required: ['name'],
+          },
+        },
+        {
+          name: 'delete_snippet',
+          description: 'Delete a saved snippet.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              name: {
+                type: 'string',
+                description: 'Name of the snippet to delete',
+              },
+            },
+            required: ['name'],
+          },
+        },
       ],
     };
   });
@@ -117,6 +198,21 @@ function createServer(): Server {
 
       case 'revoke_permission':
         return await handleRevokePermission(args ?? {});
+
+      case 'save_snippet':
+        return await handleSaveSnippet(args ?? {});
+
+      case 'list_snippets':
+        return await handleListSnippets();
+
+      case 'get_snippet':
+        return await handleGetSnippet(args ?? {});
+
+      case 'get_snippet_types':
+        return await handleGetSnippetTypes(args ?? {});
+
+      case 'delete_snippet':
+        return await handleDeleteSnippet(args ?? {});
 
       default:
         throw new Error(`Unknown tool: ${name}`);
@@ -359,6 +455,285 @@ function validatePermission(permission: Permission): string | null {
       return null;
     default:
       return `Unknown permission type "${(permission as { type: string }).type}". Valid types are: "http", "file", "env"`;
+  }
+}
+
+/**
+ * Handle the save_snippet tool
+ */
+async function handleSaveSnippet(args: Record<string, unknown>) {
+  const name = args.name as string;
+  const code = args.code as string;
+
+  if (!name || typeof name !== 'string') {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ error: 'Snippet name is required' }, null, 2),
+        },
+      ],
+    };
+  }
+
+  if (!code || typeof code !== 'string') {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ error: 'Snippet code is required' }, null, 2),
+        },
+      ],
+    };
+  }
+
+  const result = await snippetStore.save(name, code);
+
+  if (result.success) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: true,
+              message: `Snippet '${name}' saved successfully`,
+              path: `${snippetStore.getSnippetsDir()}/${name}.ts`,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  } else {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ success: false, error: result.error }, null, 2),
+        },
+      ],
+    };
+  }
+}
+
+/**
+ * Handle the list_snippets tool
+ */
+async function handleListSnippets() {
+  const result = await snippetStore.list();
+
+  if (result.error) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ error: result.error }, null, 2),
+        },
+      ],
+    };
+  }
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify(
+          {
+            snippets: result.snippets,
+            total: result.snippets.length,
+          },
+          null,
+          2
+        ),
+      },
+    ],
+  };
+}
+
+/**
+ * Handle the get_snippet tool
+ */
+async function handleGetSnippet(args: Record<string, unknown>) {
+  const name = args.name as string;
+
+  if (!name || typeof name !== 'string') {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ error: 'Snippet name is required' }, null, 2),
+        },
+      ],
+    };
+  }
+
+  const result = await snippetStore.get(name);
+
+  if (result.error) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ error: result.error }, null, 2),
+        },
+      ],
+    };
+  }
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify(result.snippet, null, 2),
+      },
+    ],
+  };
+}
+
+/**
+ * Handle the get_snippet_types tool
+ * Uses tsserver to extract type information for exported functions
+ */
+async function handleGetSnippetTypes(args: Record<string, unknown>) {
+  const name = args.name as string;
+
+  if (!name || typeof name !== 'string') {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ error: 'Snippet name is required' }, null, 2),
+        },
+      ],
+    };
+  }
+
+  // Check if snippet exists
+  const snippetResult = await snippetStore.get(name);
+  if (snippetResult.error) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ error: snippetResult.error }, null, 2),
+        },
+      ],
+    };
+  }
+
+  // Get container ID for tsserver
+  const containerId = getCurrentContainerId();
+  if (!containerId) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              error: 'Container not running. Run some code first to start the container, or enable container mode (EXECUTION_MODE=container).',
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+
+  try {
+    // Get tsserver for the container
+    const tsserver = await getTsServer(containerId);
+
+    // Get the snippet path in the container
+    // Snippets are mounted at the same location on host and need to be accessible in container
+    const snippetPath = `${CONTAINER_PATHS.code}/../snippets/${name}.ts`;
+
+    // Get exported function types
+    const functions = await tsserver.getExportedFunctionTypes(snippetPath);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              name,
+              functions: functions.map((f: ExportedFunction) => ({
+                name: f.name,
+                signature: f.typeSignature,
+                documentation: f.documentation,
+              })),
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  } catch (error) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              error: error instanceof Error ? error.message : String(error),
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+}
+
+/**
+ * Handle the delete_snippet tool
+ */
+async function handleDeleteSnippet(args: Record<string, unknown>) {
+  const name = args.name as string;
+
+  if (!name || typeof name !== 'string') {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ error: 'Snippet name is required' }, null, 2),
+        },
+      ],
+    };
+  }
+
+  const result = await snippetStore.delete(name);
+
+  if (result.success) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: true,
+              message: `Snippet '${name}' deleted successfully`,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  } else {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ success: false, error: result.error }, null, 2),
+        },
+      ],
+    };
   }
 }
 

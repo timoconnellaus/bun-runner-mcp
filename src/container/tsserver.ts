@@ -39,6 +39,21 @@ export interface DiagnosticsResult {
   diagnostics: TsDiagnostic[];
 }
 
+/** Quick info result from tsserver */
+export interface QuickInfo {
+  kind: string;
+  kindModifiers: string;
+  displayString: string;
+  documentation?: string;
+}
+
+/** Exported function type information */
+export interface ExportedFunction {
+  name: string;
+  typeSignature: string;
+  documentation?: string;
+}
+
 /**
  * TsServer instance managing a long-running TypeScript language server process.
  */
@@ -271,6 +286,127 @@ export class TsServer {
     } catch (error) {
       // Ignore errors when closing files
       console.error('[tsserver] Error closing file:', error);
+    }
+  }
+
+  /**
+   * Get quick info (type information) at a specific position in a file.
+   *
+   * @param filePath - Absolute path to the file
+   * @param line - 1-based line number
+   * @param offset - 1-based character offset
+   * @returns Quick info or null if not available
+   */
+  async getQuickInfo(filePath: string, line: number, offset: number): Promise<QuickInfo | null> {
+    try {
+      // Open the file first
+      await this.openFile(filePath);
+
+      // Get quick info at position
+      const response = await this.sendCommand('quickinfo', {
+        file: filePath,
+        line,
+        offset,
+      });
+
+      // Close the file
+      await this.closeFile(filePath);
+
+      if (!response.body) {
+        return null;
+      }
+
+      return {
+        kind: response.body.kind || '',
+        kindModifiers: response.body.kindModifiers || '',
+        displayString: response.body.displayString || '',
+        documentation: response.body.documentation || undefined,
+      };
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /**
+   * Get navigation tree for a file (symbols and their positions).
+   *
+   * @param filePath - Absolute path to the file
+   * @returns Navigation tree response
+   */
+  async getNavigationTree(filePath: string): Promise<any> {
+    try {
+      await this.openFile(filePath);
+      const response = await this.sendCommand('navtree', {
+        file: filePath,
+      });
+      await this.closeFile(filePath);
+      return response.body;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /**
+   * Get type signatures for all exported functions in a file.
+   *
+   * @param filePath - Absolute path to the file
+   * @returns Array of exported function signatures
+   */
+  async getExportedFunctionTypes(filePath: string): Promise<ExportedFunction[]> {
+    const functions: ExportedFunction[] = [];
+
+    try {
+      // Open file for analysis
+      await this.openFile(filePath);
+
+      // Get navigation tree to find exported items
+      const navTree = await this.sendCommand('navtree', {
+        file: filePath,
+      });
+
+      if (!navTree.body || !navTree.body.childItems) {
+        await this.closeFile(filePath);
+        return functions;
+      }
+
+      // Find exported functions from navigation tree
+      const processItem = async (item: any): Promise<void> => {
+        // Check for function declarations that are exported
+        if (item.kind === 'function' && item.kindModifiers?.includes('export')) {
+          // Get type info at the function position
+          const quickInfo = await this.sendCommand('quickinfo', {
+            file: filePath,
+            line: item.spans[0]?.start?.line || 1,
+            offset: item.spans[0]?.start?.offset || 1,
+          });
+
+          if (quickInfo.body) {
+            functions.push({
+              name: item.text,
+              typeSignature: quickInfo.body.displayString || '',
+              documentation: quickInfo.body.documentation || undefined,
+            });
+          }
+        }
+
+        // Process child items recursively
+        if (item.childItems) {
+          for (const child of item.childItems) {
+            await processItem(child);
+          }
+        }
+      };
+
+      // Process all items in the tree
+      for (const item of navTree.body.childItems) {
+        await processItem(item);
+      }
+
+      await this.closeFile(filePath);
+      return functions;
+    } catch (error) {
+      console.error('[tsserver] Error getting exported function types:', error);
+      return functions;
     }
   }
 

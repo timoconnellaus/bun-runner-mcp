@@ -35,12 +35,17 @@ export const RESOURCE_LIMITS = {
 /** Execution timeout in milliseconds */
 export const EXECUTION_TIMEOUT_MS = 30000;
 
+/** Directory for stored snippets */
+export const SNIPPETS_DIR = join(DATA_DIR, 'snippets');
+
 /** Container paths for volume mounts */
 export const CONTAINER_PATHS = {
   /** Mount point for package cache inside container */
   packages: '/packages',
   /** Mount point for code files inside container */
   code: '/code',
+  /** Mount point for snippets inside container */
+  snippets: '/.bun-runner-mcp/snippets',
 } as const;
 
 /** Environment variables set inside container */

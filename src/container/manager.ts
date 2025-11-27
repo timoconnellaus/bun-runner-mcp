@@ -6,6 +6,7 @@ import {
   CONTAINER_CLI,
   BASE_IMAGE_NAME,
   PACKAGE_CACHE_DIR,
+  SNIPPETS_DIR,
   CONTAINER_PATHS,
   CONTAINER_ENV,
   RESOURCE_LIMITS,
@@ -139,6 +140,9 @@ export async function startContainer(
     // Ensure package cache directory exists
     await mkdir(PACKAGE_CACHE_DIR, { recursive: true });
 
+    // Ensure snippets directory exists
+    await mkdir(SNIPPETS_DIR, { recursive: true });
+
     // Create temp directory for code files on host
     const codeDir = join(tmpdir(), `bun-runner-code-${containerId}`);
     await mkdir(codeDir, { recursive: true });
@@ -157,6 +161,7 @@ export async function startContainer(
       // Volume mounts
       '--volume', `${PACKAGE_CACHE_DIR}:${CONTAINER_PATHS.packages}`,
       '--volume', `${codeDir}:${CONTAINER_PATHS.code}`,
+      '--volume', `${SNIPPETS_DIR}:${CONTAINER_PATHS.snippets}`,
       // Resource limits
       '--cpus', String(cpus),
       '--memory', `${memoryMB}m`,

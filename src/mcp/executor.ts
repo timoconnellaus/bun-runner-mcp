@@ -10,6 +10,7 @@ import {
   executeInSessionContainer,
   cleanupSessionContainer,
 } from '../container/index.js';
+import { inlineSnippets } from '../snippets/index.js';
 
 const PROXY_URL = 'http://localhost:9999';
 
@@ -59,9 +60,24 @@ export async function executeInSandbox(
 ): Promise<ExecutionResult> {
   const { timeout = 30000 } = options;
 
+  // Inline any referenced snippets
+  const inlineResult = await inlineSnippets(code);
+  if (!inlineResult.success) {
+    return {
+      success: false,
+      error: inlineResult.error || 'Failed to inline snippets',
+      exitCode: -1,
+    };
+  }
+
+  const processedCode = inlineResult.code!;
+  if (inlineResult.snippetsUsed && inlineResult.snippetsUsed.length > 0) {
+    console.error(`[executor] Inlined ${inlineResult.snippetsUsed.length} snippet(s): ${inlineResult.snippetsUsed.join(', ')}`);
+  }
+
   // Check if container mode is enabled
   if (isContainerMode()) {
-    return executeInContainer(code, options);
+    return executeInContainer(processedCode, options);
   }
 
   // Check if proxy server is available
@@ -78,8 +94,8 @@ export async function executeInSandbox(
   const tempFile = join(tmpdir(), `bun-runner-${crypto.randomUUID()}.ts`);
 
   try {
-    // Write code to temporary file
-    await writeFile(tempFile, code, 'utf-8');
+    // Write processed code (with inlined snippets) to temporary file
+    await writeFile(tempFile, processedCode, 'utf-8');
 
     // Prepare environment variables
     const env = {
