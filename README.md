@@ -6,6 +6,8 @@ An MCP (Model Context Protocol) server that executes TypeScript/JavaScript code 
 
 - **Sandboxed Execution**: Run TypeScript/JavaScript code in an isolated environment
 - **Permission System**: Fine-grained control over HTTP requests, file access, and environment variables
+- **Code Snippets**: Save and reuse code snippets across sessions with dependency resolution
+- **Web Management UI**: Browser-based interface for managing environment variables and viewing snippets
 - **Two Execution Modes**:
   - **Preload** (default): Uses Bun's preload feature for runtime sandboxing
   - **Container**: Uses Apple Containers for VM-level isolation (macOS 26+)
@@ -127,6 +129,99 @@ List all currently granted permissions.
 ### `revoke_permission`
 
 Revoke a previously granted permission.
+
+### `save_snippet`
+
+Save a reusable code snippet. Snippets must include a JSDoc `@description` tag.
+
+```json
+{
+  "name": "fetch-json",
+  "code": "/** @description Fetches JSON from a URL */\nexport async function fetchJson(url: string) {\n  const res = await fetch(url);\n  return res.json();\n}"
+}
+```
+
+### `list_snippets`
+
+List all saved snippets with their names and descriptions.
+
+### `get_snippet`
+
+Get the full code and metadata for a saved snippet.
+
+### `delete_snippet`
+
+Delete a saved snippet.
+
+### `list_env_vars`
+
+List available environment variable names (values are hidden for security).
+
+### `get_web_ui_url`
+
+Get the URL for the web management interface. The AI can use this to direct users to the browser UI.
+
+## Code Snippets
+
+Snippets are reusable code blocks that persist across sessions. They're stored in `~/.bun-runner-mcp/snippets/`.
+
+### Using Snippets in Code
+
+Reference snippets in your code using the `@use-snippet` directive:
+
+```typescript
+// @use-snippet: fetch-json
+// @use-snippet: format-date
+
+const data = await fetchJson('https://api.example.com/data');
+console.log(formatDate(data.timestamp));
+```
+
+The snippet code is automatically inlined before execution. Snippets can depend on other snippets, and circular dependencies are detected.
+
+### Snippet Requirements
+
+- Must include a JSDoc comment with `@description` tag
+- Name must be alphanumeric with hyphens/underscores
+- Should export functions for reuse
+
+## Environment Variables
+
+Environment variables can be configured for use in executed code:
+
+### Configuration Sources
+
+1. **MCP Config**: Pass variables with `BUN_` prefix in your MCP config:
+   ```json
+   {
+     "env": {
+       "BUN_API_KEY": "your-api-key",
+       "BUN_DEBUG": "true"
+     }
+   }
+   ```
+   The `BUN_` prefix is stripped when accessed in code (e.g., `process.env.API_KEY`).
+
+2. **Env File**: Create `~/.bun-runner-mcp/.bun-runner-env`:
+   ```
+   API_KEY=your-api-key
+   DATABASE_URL=postgres://localhost/db
+   ```
+
+File variables take precedence over MCP config variables.
+
+### Hot Reload
+
+The env file is watched for changes. When modified, variables are automatically reloaded (and containers restarted if in container mode).
+
+## Web Management UI
+
+A browser-based interface is available at `http://localhost:9999` for:
+
+- **Environment Variables**: Add, edit, and delete environment variables
+- **Code Snippets**: View saved snippets and their code
+
+The web UI is built automatically when the server starts using Bun's native bundler.
 
 ## Execution Modes
 

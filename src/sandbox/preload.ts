@@ -79,6 +79,8 @@ const sandboxedFetch = async (input: RequestInfo | URL, init?: RequestInit): Pro
     if (proxyResponse.status === 403) {
       const errorData = await proxyResponse.json();
       if (errorData.code === 'PERMISSION_DENIED') {
+        // Output JSON to stderr for executor to parse
+        console.error(JSON.stringify(errorData));
         throw new PermissionError({
           requiredPermission: errorData.requiredPermission,
           requestId: errorData.requestId,
@@ -87,8 +89,20 @@ const sandboxedFetch = async (input: RequestInfo | URL, init?: RequestInit): Pro
       }
     }
 
-    // Return the response from proxy
-    return proxyResponse;
+    // Parse the proxy response to reconstruct the actual HTTP response
+    const proxyData = await proxyResponse.json() as {
+      status: number;
+      statusText: string;
+      headers: Record<string, string>;
+      body: string;
+    };
+
+    // Reconstruct Response object with actual response data
+    return new Response(proxyData.body, {
+      status: proxyData.status,
+      statusText: proxyData.statusText,
+      headers: new Headers(proxyData.headers),
+    });
   } catch (error) {
     // Re-throw PermissionError as-is
     if (error instanceof PermissionError) {
@@ -141,20 +155,45 @@ if (typeof Bun !== 'undefined') {
   });
 }
 
-// Block process.env access (could be made permission-aware later)
+// Get allowed env vars from ALLOWED_ENV_VARS (comma-separated list)
+const ALLOWED_ENV_VARS = (process.env.ALLOWED_ENV_VARS || '').split(',').filter(Boolean);
+
+// Cache the actual values before replacing process.env
+const cachedEnvValues: Record<string, string | undefined> = {};
+for (const key of ALLOWED_ENV_VARS) {
+  cachedEnvValues[key] = process.env[key];
+}
+
+// Replace process.env with a proxy that only allows specific vars
 Object.defineProperty(process, 'env', {
   get() {
-    // Return empty object or filtered env vars
-    // For now, block all access
     return new Proxy({} as Record<string, string | undefined>, {
-      get() {
-        throw new Error('process.env access is blocked in sandbox mode. Environment variable access requires explicit permissions.');
+      get(_, key: string) {
+        if (ALLOWED_ENV_VARS.includes(key)) {
+          return cachedEnvValues[key];
+        }
+        // Provide helpful error message
+        const available = ALLOWED_ENV_VARS.length > 0
+          ? `Available: ${ALLOWED_ENV_VARS.join(', ')}`
+          : 'No env vars configured. Add them to ~/.bun-runner-mcp/.bun-runner-env';
+        throw new Error(`process.env.${key} access is blocked. ${available}`);
       },
-      has() {
-        return false;
+      has(_, key: string) {
+        return ALLOWED_ENV_VARS.includes(key);
       },
       ownKeys() {
-        return [];
+        return ALLOWED_ENV_VARS;
+      },
+      getOwnPropertyDescriptor(_, key: string) {
+        if (ALLOWED_ENV_VARS.includes(key)) {
+          return {
+            value: cachedEnvValues[key],
+            writable: false,
+            enumerable: true,
+            configurable: true,
+          };
+        }
+        return undefined;
       },
     });
   },

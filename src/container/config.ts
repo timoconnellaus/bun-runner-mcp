@@ -7,7 +7,7 @@ import { join } from 'node:path';
  */
 
 /** Base directory for all bun-runner-mcp data */
-export const DATA_DIR = join(homedir(), '.bun-runner-mcp');
+export const DATA_DIR = process.env.BUN_RUNNER_DATA_DIR || join(homedir(), '.bun-runner-mcp');
 
 /** Directory for cached npm packages */
 export const PACKAGE_CACHE_DIR = join(DATA_DIR, 'packages');
@@ -37,6 +37,12 @@ export const EXECUTION_TIMEOUT_MS = 30000;
 
 /** Directory for stored snippets */
 export const SNIPPETS_DIR = join(DATA_DIR, 'snippets');
+
+/** User environment variables file */
+export const ENV_FILE = join(DATA_DIR, '.bun-runner-env');
+
+/** Prefix for env vars passed through MCP config */
+export const ENV_VAR_PREFIX = 'BUN_';
 
 /** Container paths for volume mounts */
 export const CONTAINER_PATHS = {

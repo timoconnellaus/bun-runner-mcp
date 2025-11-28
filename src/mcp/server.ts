@@ -20,6 +20,9 @@ import { SnippetStore } from '../snippets/store.js';
 import { getCurrentContainerId } from '../container/session.js';
 import { getTsServer, type ExportedFunction } from '../container/tsserver.js';
 import { CONTAINER_PATHS } from '../container/config.js';
+import { loadEnvVars, getEnvVarNames, getAllEnvVars, setEnvVar, deleteEnvVar, watchEnvFile, unwatchEnvFile } from '../env/index.js';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // Global shared permission store (used by both MCP tools and HTTP proxy)
 const permissionStore = new PermissionStore();
@@ -178,6 +181,27 @@ function createServer(): Server {
             required: ['name'],
           },
         },
+        {
+          name: 'list_env_vars',
+          description:
+            'List available environment variables (names only, not values). ' +
+            'These are configured in ~/.bun-runner-mcp/.bun-runner-env or via MCP config with BUN_ prefix.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
+        {
+          name: 'get_web_ui_url',
+          description:
+            'Get the URL for the bun-runner web management interface. ' +
+            'The web UI allows managing environment variables and viewing code snippets. ' +
+            'Tell the user to open this URL in their browser.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
       ],
     };
   });
@@ -213,6 +237,12 @@ function createServer(): Server {
 
       case 'delete_snippet':
         return await handleDeleteSnippet(args ?? {});
+
+      case 'list_env_vars':
+        return await handleListEnvVars();
+
+      case 'get_web_ui_url':
+        return handleGetWebUIUrl();
 
       default:
         throw new Error(`Unknown tool: ${name}`);
@@ -691,6 +721,60 @@ async function handleGetSnippetTypes(args: Record<string, unknown>) {
 }
 
 /**
+ * Handle the list_env_vars tool
+ */
+async function handleListEnvVars() {
+  const envVarNames = getEnvVarNames();
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify(
+          {
+            envVars: envVarNames,
+            total: envVarNames.length,
+            note: envVarNames.length > 0
+              ? 'These env vars are available in process.env when code runs.'
+              : 'No env vars configured. Add them to ~/.bun-runner-mcp/.bun-runner-env or use BUN_ prefix in MCP config.',
+          },
+          null,
+          2
+        ),
+      },
+    ],
+  };
+}
+
+/**
+ * Handle the get_web_ui_url tool
+ */
+function handleGetWebUIUrl() {
+  const port = parseInt(process.env.BUN_RUNNER_HTTP_PORT || '9999', 10);
+  const url = `http://localhost:${port}`;
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify(
+          {
+            url,
+            message: `The bun-runner-mcp web UI is available at ${url}`,
+            features: [
+              'Manage environment variables (add, edit, delete)',
+              'View saved code snippets',
+            ],
+          },
+          null,
+          2
+        ),
+      },
+    ],
+  };
+}
+
+/**
  * Handle the delete_snippet tool
  */
 async function handleDeleteSnippet(args: Record<string, unknown>) {
@@ -740,8 +824,84 @@ async function handleDeleteSnippet(args: Record<string, unknown>) {
 // Store HTTP server reference for cleanup
 let httpServer: ReturnType<typeof Bun.serve> | null = null;
 
+// Cache for built frontend assets
+let frontendBuildCache: Map<string, { content: string; contentType: string }> | null = null;
+
 /**
- * Start the HTTP server for proxy functionality.
+ * Build the frontend using Bun's bundler.
+ * Returns a map of paths to bundled content.
+ */
+async function buildFrontend(): Promise<Map<string, { content: string; contentType: string }>> {
+  const currentDir = dirname(fileURLToPath(import.meta.url));
+  const webDir = join(currentDir, '../../web');
+  const distDir = join(currentDir, '../../dist-web');
+
+  const cache = new Map<string, { content: string; contentType: string }>();
+
+  try {
+    // Build the frontend
+    const result = await Bun.build({
+      entrypoints: [join(webDir, 'index.html')],
+      outdir: distDir,
+      target: 'browser',
+      minify: process.env.NODE_ENV === 'production',
+    });
+
+    if (!result.success) {
+      console.error('[web] Frontend build failed:', result.logs);
+      return cache;
+    }
+
+    // Read all built files from dist-web into cache
+    const glob = new Bun.Glob('*');
+    for await (const filename of glob.scan(distDir)) {
+      const filePath = join(distDir, filename);
+      const file = Bun.file(filePath);
+      const content = await file.text();
+      const contentType = getContentType(filename);
+
+      // Cache with leading slash
+      cache.set('/' + filename, { content, contentType });
+
+      // Also cache index.html at root
+      if (filename === 'index.html') {
+        cache.set('/', { content, contentType });
+      }
+    }
+
+    console.error(`[web] Frontend built: ${cache.size} files cached`);
+  } catch (err) {
+    console.error('[web] Frontend build error:', err);
+  }
+
+  return cache;
+}
+
+/**
+ * Get content type based on file extension.
+ */
+function getContentType(filePath: string): string {
+  const ext = filePath.split('.').pop()?.toLowerCase() || '';
+  const types: Record<string, string> = {
+    html: 'text/html',
+    css: 'text/css',
+    js: 'application/javascript',
+    json: 'application/json',
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    gif: 'image/gif',
+    svg: 'image/svg+xml',
+    ico: 'image/x-icon',
+    woff: 'font/woff',
+    woff2: 'font/woff2',
+    ttf: 'font/ttf',
+  };
+  return types[ext] || 'application/octet-stream';
+}
+
+/**
+ * Start the HTTP server for proxy and web UI functionality.
  * This server runs on port 9999 and handles:
  * - /proxy - HTTP proxy requests (checks permissions and forwards)
  * - /grant - Grant a permission
@@ -749,9 +909,12 @@ let httpServer: ReturnType<typeof Bun.serve> | null = null;
  * - /permissions - List all permissions
  * - /clear - Clear all permissions
  * - /health - Health check
+ * - /api/env - Environment variable CRUD (GET, POST, PUT, DELETE)
+ * - /api/snippets - Snippet listing and retrieval (GET)
+ * - /* - Static file serving for web UI
  */
 function startHttpServer(): void {
-  const PORT = 9999;
+  const PORT = parseInt(process.env.BUN_RUNNER_HTTP_PORT || '9999', 10);
 
   httpServer = Bun.serve({
     port: PORT,
@@ -900,6 +1063,136 @@ function startHttpServer(): void {
           });
         }
 
+        // === API ROUTES FOR WEB UI ===
+
+        // GET /api/env - List all env vars with values
+        if (path === '/api/env' && req.method === 'GET') {
+          const envVars = getAllEnvVars();
+          return new Response(JSON.stringify({
+            envVars: Object.entries(envVars).map(([name, value]) => ({ name, value })),
+            total: Object.keys(envVars).length,
+          }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+
+        // POST /api/env - Create env var
+        if (path === '/api/env' && req.method === 'POST') {
+          const body = await req.json() as { name: string; value: string };
+          if (!body.name || typeof body.value !== 'string') {
+            return new Response(JSON.stringify({ error: 'name and value are required' }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+          try {
+            await setEnvVar(body.name, body.value);
+            return new Response(JSON.stringify({ success: true, envVar: { name: body.name, value: body.value } }), {
+              status: 201,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          } catch (err) {
+            return new Response(JSON.stringify({ error: err instanceof Error ? err.message : 'Unknown error' }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+        }
+
+        // PUT /api/env/:name - Update env var
+        if (path.startsWith('/api/env/') && req.method === 'PUT') {
+          const name = decodeURIComponent(path.slice('/api/env/'.length));
+          const body = await req.json() as { value: string };
+          if (typeof body.value !== 'string') {
+            return new Response(JSON.stringify({ error: 'value is required' }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+          try {
+            await setEnvVar(name, body.value);
+            return new Response(JSON.stringify({ success: true, envVar: { name, value: body.value } }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          } catch (err) {
+            return new Response(JSON.stringify({ error: err instanceof Error ? err.message : 'Unknown error' }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+        }
+
+        // DELETE /api/env/:name - Delete env var
+        if (path.startsWith('/api/env/') && req.method === 'DELETE') {
+          const name = decodeURIComponent(path.slice('/api/env/'.length));
+          const deleted = await deleteEnvVar(name);
+          if (deleted) {
+            return new Response(JSON.stringify({ success: true, deleted: name }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          } else {
+            return new Response(JSON.stringify({ error: 'Not found' }), {
+              status: 404,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+        }
+
+        // GET /api/snippets - List all snippets
+        if (path === '/api/snippets' && req.method === 'GET') {
+          const snippets = await snippetStore.list();
+          return new Response(JSON.stringify({
+            snippets,
+            total: snippets.length,
+          }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+
+        // GET /api/snippets/:name - Get snippet detail
+        if (path.startsWith('/api/snippets/') && req.method === 'GET') {
+          const name = decodeURIComponent(path.slice('/api/snippets/'.length));
+          const snippet = await snippetStore.get(name);
+          if (snippet) {
+            return new Response(JSON.stringify(snippet), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          } else {
+            return new Response(JSON.stringify({ error: 'Snippet not found' }), {
+              status: 404,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+        }
+
+        // === STATIC FILE SERVING FOR WEB UI ===
+
+        // Serve from build cache
+        if (req.method === 'GET' && frontendBuildCache) {
+          // Check for exact path match
+          const cached = frontendBuildCache.get(path);
+          if (cached) {
+            return new Response(cached.content, {
+              headers: { 'Content-Type': cached.contentType },
+            });
+          }
+
+          // SPA fallback: serve index.html for non-asset routes
+          if (!path.includes('.')) {
+            const indexCached = frontendBuildCache.get('/');
+            if (indexCached) {
+              return new Response(indexCached.content, {
+                headers: { 'Content-Type': indexCached.contentType },
+              });
+            }
+          }
+        }
+
         // Unknown endpoint
         return new Response(JSON.stringify({ error: 'Not found' }), {
           status: 404,
@@ -929,6 +1222,7 @@ function startHttpServer(): void {
  */
 function cleanup() {
   console.error('Shutting down...');
+  unwatchEnvFile();
   if (httpServer) {
     httpServer.stop();
     httpServer = null;
@@ -956,6 +1250,13 @@ async function main() {
     console.error('stdin closed, shutting down');
     cleanup();
   });
+
+  // Load user environment variables
+  await loadEnvVars();
+  watchEnvFile();
+
+  // Build frontend assets
+  frontendBuildCache = await buildFrontend();
 
   // Start HTTP server first
   startHttpServer();

@@ -13,6 +13,7 @@ import {
   EXECUTION_TIMEOUT_MS,
 } from './config.js';
 import { getDiagnostics, stopTsServer } from './tsserver.js';
+import { getEnvVars } from '../env/index.js';
 
 /**
  * Bun configuration for package caching.
@@ -165,8 +166,9 @@ export async function startContainer(
       // Resource limits
       '--cpus', String(cpus),
       '--memory', `${memoryMB}m`,
-      // Environment variables
+      // Environment variables (system + user)
       ...Object.entries(CONTAINER_ENV).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
+      ...Object.entries(getEnvVars()).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
       // Base image
       BASE_IMAGE_NAME,
       // Keep container running with sleep infinity

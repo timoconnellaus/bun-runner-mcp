@@ -11,8 +11,10 @@ import {
   cleanupSessionContainer,
 } from '../container/index.js';
 import { inlineSnippets } from '../snippets/index.js';
+import { getEnvVars, getEnvVarNames } from '../env/index.js';
 
-const PROXY_URL = 'http://localhost:9999';
+const PROXY_PORT = process.env.BUN_RUNNER_HTTP_PORT || '9999';
+const PROXY_URL = `http://localhost:${PROXY_PORT}`;
 
 export interface ExecutionResult {
   success: boolean;
@@ -98,9 +100,14 @@ export async function executeInSandbox(
     await writeFile(tempFile, processedCode, 'utf-8');
 
     // Prepare environment variables
+    const userVars = getEnvVars();
+    const allowedVarNames = getEnvVarNames();
     const env = {
       ...process.env,
+      ...userVars,
       PROXY_URL: PROXY_URL,
+      // Pass list of allowed env var names to preload
+      ALLOWED_ENV_VARS: allowedVarNames.join(','),
     };
 
     // Execute the code using Bun with preload for sandboxing
